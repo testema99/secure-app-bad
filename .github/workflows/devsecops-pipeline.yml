@@ -1,1 +1,122 @@
+name: DevSecOps Pipeline (BAD - Intentional Failures)
 
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  IMAGE_NAME: secure-app-bad
+
+jobs:
+
+  # STAGE 1: Dependency scan — will FAIL due to Werkzeug 1.0.0 and Jinja2 2.10.0 CVEs
+  dependency-scan:
+    name: Dependency Scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # BAD PRACTICE: ignoring install errors — broken deps won't stop pipeline here
+        run: pip install -r requirements.txt || true
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      # BAD PRACTICE: exit-code not suppressed — this WILL fail and block the pipeline
+      # This is intentional: Werkzeug 1.0.0 and Jinja2 2.10.0 have known HIGH/CRITICAL CVEs
+      - name: Run pip-audit (will fail on CVEs)
+        run: pip-audit -r requirements.txt
+
+  # STAGE 2: Unit tests — will FAIL because tests have wrong assertions
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: dependency-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install flask pytest pytest-cov
+
+      # Will fail: test_get_items_wrong asserts 404, real response is 200
+      #            test_create_item_no_data sends empty JSON, causes KeyError 500
+      - name: Run tests with coverage
+        run: pytest tests/ -v --cov=app --cov-report=term-missing --cov-fail-under=80
+
+  # STAGE 3: Build — python:3.6-slim is EOL but will still build
+  build:
+    name: Build Container
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t $IMAGE_NAME:${{ github.sha }} .
+
+      - name: Save image as tarball
+        run: docker save $IMAGE_NAME:${{ github.sha }} -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-bad
+          path: image.tar
+          retention-days: 1
+
+  # STAGE 4: Container scan — will FAIL due to python:3.6-slim CVEs
+  container-scan:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-bad
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      # BAD PRACTICE: exit-code 1 here means real CVEs will block deploy
+      # python:3.6-slim has many CRITICAL unpatched OS CVEs
+      - name: Run Trivy scan (will fail on CRITICAL CVEs)
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --format table \
+            $IMAGE_NAME:${{ github.sha }}
+
+  # STAGE 5: Deploy — will be SKIPPED because earlier stages fail
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: container-scan
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy (should never reach here)
+        run: |
+          echo "This should never print — pipeline was blocked by security failures."
+          echo "Deploying $IMAGE_NAME:${{ github.sha }} to production..."
