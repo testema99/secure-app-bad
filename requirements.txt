@@ -1,1 +1,8 @@
+# BAD PRACTICE: unpinned versions — will install whatever is latest
+flask
+pytest
+pytest-cov
 
+# BAD PRACTICE: old vulnerable versions with known CVEs
+Werkzeug==1.0.0
+Jinja2==2.10.0
